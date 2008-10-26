@@ -30,11 +30,7 @@ function Expiration:OnInitialize()
 	}
 
 	self.db = LibStub:GetLibrary("AceDB-3.0"):New("ExpirationDB", self.defaults)
-	--self.db.RegisterCallback(self, "OnProfileChanged", "Reload")
-	--self.db.RegisterCallback(self, "OnProfileCopied", "Reload")
-	--self.db.RegisterCallback(self, "OnProfileReset", "Reload")
-
-	self.revision = tonumber(string.match("$Revision: 979 $", "(%d+)") or 1)
+	self.revision = tonumber(string.match("$Revision$", "(%d+)") or 1)
 
 	self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 	self:RegisterEvent("PLAYER_ENTERING_WORLD", "UpdateRoster")
@@ -218,7 +214,7 @@ function Expiration:AddReport(guid)
 	
 	-- Reuse an old report if we can
 	if( #(playerInfo.reports) >= self.db.profile.reports ) then
-		report = tabel.remove(playerInfo.reports, 1)
+		report = table.remove(playerInfo.reports, 1)
 		
 		for i=#(report), 1, -1 do
 			table.remove(report, i)
