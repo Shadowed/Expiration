@@ -25,16 +25,19 @@ function Expiration:OnInitialize()
 			threshold = 0,
 			reports = 5,
 			health = true,
+			cooldowns = false,
 			location = "console",
 		},
 	}
 
 	self.db = LibStub:GetLibrary("AceDB-3.0"):New("ExpirationDB", self.defaults)
 	self.revision = tonumber(string.match("$Revision$", "(%d+)") or 1)
+	self.cooldowns = ExpirationSpells
 
 	self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 	self:RegisterEvent("PLAYER_ENTERING_WORLD", "UpdateRoster")
 	self:RegisterEvent("RAID_ROSTER_UPDATED", "UpdateRoster")
+	self:RegisterEvent("PARTY_MEMBERS_CHANGED", "UpdateRoster")
 	
 	-- So we don't have to keep creating these
 	for i=1, MAX_RAID_MEMBERS do
@@ -83,7 +86,16 @@ SlashCmdList["EXPIRATION"] = function(msg)
 		else
 			self:Print(L["No longer showing health in death reports."])
 		end
-	
+	--[[
+	elseif( cmd == "cooldowns" ) then
+		self.db.profile.cooldowns = not self.db.profile.cooldowns
+		
+		if( self.db.profile.health ) then
+			self:Print(L["Now keeping track of player cooldowns on death."])
+		else
+			self:Print(L["No longer track of player cooldowns on death."])
+		end
+	]]
 	elseif( cmd == "report" and arg ) then
 		local name, report, dest, lines = string.split(" ", arg)
 		if( not name ) then
@@ -101,6 +113,8 @@ SlashCmdList["EXPIRATION"] = function(msg)
 		self:Echo(L["/expiration threshold <num> - Minimum number of damage/healing needed to save the event."])
 		self:Echo(L["/expiration reports <num> - Total number of death reports to save per a person."])
 		self:Echo(L["/expiration location <console/raid/party/guild/officer> - Default location to send reports."])
+		self:Echo(L["/expiration health - Toggles showing players health in death report."])
+		--self:Echo(L["/expiration cooldown - Toggles showing players cooldowns in death report."])
 		self:Echo(L["/expiration report <name> <report# or \'last\'> [dest[:target]] [lines] - Report on a given player."])
 	end
 end
@@ -127,6 +141,7 @@ local events = {
 	["SPELL_PERIODIC_DRAIN"] = 4,
 	["SPELL_PERIODIC_LEECH"] = 4,
 	["SPELL_DISPEL_FAILED"] = -1,
+	--["SPELL_CAST_SUCCESS"] = -1,
 	["DAMAGE_SHIELD"] = 4,
 	["UNIT_DIED"] = -1,
 	["UNIT_DESTROYED"] = -1,
@@ -155,11 +170,18 @@ local COMBATLOG_OBJECT_TYPE_PLAYER = COMBATLOG_OBJECT_TYPE_PLAYER
 local GROUP_AFFILIATION = bit.bor(COMBATLOG_OBJECT_AFFILIATION_PARTY, COMBATLOG_OBJECT_AFFILIATION_RAID, COMBATLOG_OBJECT_AFFILIATION_MINE)
 
 function Expiration:COMBAT_LOG_EVENT_UNFILTERED(event, timestamp, eventType, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, ...)
-	if( not events[eventType] or ( bit.band(destFlags, GROUP_AFFILIATION) == 0 or bit.band(destFlags, COMBATLOG_OBJECT_TYPE_PLAYER) ~= COMBATLOG_OBJECT_TYPE_PLAYER ) ) then return end
+	--if( not events[eventType] or ( bit.band(destFlags, GROUP_AFFILIATION) == 0 or bit.band(destFlags, COMBATLOG_OBJECT_TYPE_PLAYER) ~= COMBATLOG_OBJECT_TYPE_PLAYER ) ) then return end
+	if( not events[eventType] or not groupUnitMap[destGUID] ) then return end
 	
 	groupInfo[destGUID] = groupInfo[destGUID] or {history = {}, reports = {}}
-	
 	local playerInfo = groupInfo[destGUID]
+	
+	-- Save cooldown information
+	--if( self.db.profile.cooldowns and eventType == "SPELL_CAST_SUCCESS" ) then
+	--	return
+	--end
+	
+	-- Save last event in case they died after
 	if( killEvents[eventType] ) then
 		playerInfo.lastEvent = eventType
 		playerInfo.lastSpell = eventType == "ENVIRONMENTAL_DAMAGE" and getglobal("ACTION_ENVIRONMENTAL_DAMAGE_" .. (select(1, ...))) or eventType == "SWING_DAMAGE" and L["Melee"] or (select(2, ...))
@@ -272,7 +294,7 @@ function Expiration:Report(name, reportNum, dest, lines)
 	if( not reportNum ) then
 		self:Print(string.format(L["Deaths for player %s (%d total)"], name, #(playerInfo.reports)))
 		for id, report in pairs(playerInfo.reports) do
-			self:Echo(string.format("%d) %s - %s", id, date("%H:%M:%S"), report.cause))
+			self:Echo(string.format("%d) %s - %s", id, date("%H:%M:%S", report.time), report.cause))
 		end
 		return
 	-- Use the last found report
@@ -308,7 +330,9 @@ function Expiration:Report(name, reportNum, dest, lines)
 	if( type == "console" ) then
 		self:Print(string.format(L["Report for %s (Last %d events)"], name, lines))
 		for line = #(report) - lines + 1, #(report) do
-			self:Echo(string.format("%d. %s", #report - line + 1, report[line]))
+			if( report[line] ) then
+				self:Echo(string.format("%d. %s", #report - line + 1, report[line]))
+			end
 		end
 		return
 	elseif( not validType[type] ) then
@@ -344,7 +368,9 @@ function Expiration:Report(name, reportNum, dest, lines)
 	
 	SendChatMessage(string.format(L["Expiration report for %s (Last %d events)"], name, lines), type, nil, target)
 	for line = #(report - lines + 1), #(report) do
-		SendChatMessage(string.format("%d. %s", #report - line + 1, report[line]), type, nil, target)
+		if( report[line] ) then
+			SendChatMessage(string.format("%d. %s", #report - line + 1, report[line]), type, nil, target)
+		end
 	end
 end
 

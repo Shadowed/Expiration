@@ -13,6 +13,8 @@ ExpirationLocals = {
 	["/expiration reports <num> - Total number of death reports to save per a person."] = "/expiration reports <num> - Total number of death reports to save per a person.",
 	["/expiration location <console/raid/party/guild/officer> - Default location to send reports."] = "/expiration location <console/raid/party/guild/officer> - Default location to send reports.",
 	["/expiration report <name> <report# or \'last\'> [dest[:target]] [lines] - Report on a given player."] = "/expiration report <name> <report# or \'last\'> [dest[:target]] [lines] - Report on a given player.",
+	["/expiration health - Toggles showing players health in death report."] = "/expiration health - Toggles showing players health in death report.",
+	["/expiration cooldown - Toggles showing players cooldowns in death report."] = "/expiration cooldown - Toggles showing players cooldowns in death report.",
 	
 	["Now showing health in death reports."] = "Now showing health in death reports.",
 	["No longer showing health in death reports."] = "No longer showing health in death reports.",
@@ -21,6 +23,8 @@ ExpirationLocals = {
 	["Total saved death reports set to %d."] = "Total saved death reports set to %d.",
 	["Invalid report location entered \"%s\"."] = "Invalid report location entered \"%s\".",
 	["Set default report location to \"%s\"."] = "Set default report location to \"%s\".",
+	["Now keeping track of player cooldowns on death."] = "Now keeping track of player cooldowns on death.",
+	["No longer track of player cooldowns on death."] = "No longer track of player cooldowns on death.",
 		
 	["No data found for player \"%s\"."] = "No data found for player \"%s\".",
 	["No deaths found for player \"%s\"."] = "No deaths found for player \"%s\".",

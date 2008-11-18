@@ -13,4 +13,5 @@ libs\AceDB-3.0\AceDB-3.0.xml
 
 localization.enUS.lua
 
+spells.lua
 Expiration.lua
