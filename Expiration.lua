@@ -3,10 +3,11 @@
 ]]
 
 Expiration = LibStub("AceAddon-3.0"):NewAddon("Expiration", "AceEvent-3.0")
+ExpirationTest = {}
 
 local L = ExpirationLocals
-local groupInfo = {}
-local groupUnitMap = {}
+local groupInfo = ExpirationTest
+local nameToGUID = {}
 local raidMap, partyMap = {}, {}
 local validTypes = {
 	["party"] = "PARTY", ["p"] = "PARTY",
@@ -16,7 +17,6 @@ local validTypes = {
 	["whisper"] = "WHISPER", ["w"] = "WHISPER",
 	["channel"] = "CHANNEL", ["c"] = "CHANNEL",
 }
-
 
 function Expiration:OnInitialize()
 	self.defaults = {
@@ -35,9 +35,6 @@ function Expiration:OnInitialize()
 	self.cooldowns = ExpirationSpells
 
 	self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-	self:RegisterEvent("PLAYER_ENTERING_WORLD", "UpdateRoster")
-	self:RegisterEvent("RAID_ROSTER_UPDATED", "UpdateRoster")
-	self:RegisterEvent("PARTY_MEMBERS_CHANGED", "UpdateRoster")
 	
 	-- So we don't have to keep creating these
 	for i=1, MAX_RAID_MEMBERS do
@@ -70,7 +67,7 @@ SlashCmdList["EXPIRATION"] = function(msg)
 	
 	elseif( cmd == "location" and arg ) then
 		arg = string.lower(arg)
-		if( arg ~= "console" and not validTypes[arg] ) then
+		if( arg ~= "console" and arg ~= "frame" and not validTypes[arg] ) then
 			self:Print(string.format(L["Invalid report location entered \"%s\"."], arg))
 			return
 		end
@@ -112,7 +109,7 @@ SlashCmdList["EXPIRATION"] = function(msg)
 		self:Echo(L["/expiration lines <num> - Total number of lines to save per a death report."])
 		self:Echo(L["/expiration threshold <num> - Minimum number of damage/healing needed to save the event."])
 		self:Echo(L["/expiration reports <num> - Total number of death reports to save per a person."])
-		self:Echo(L["/expiration location <console/raid/party/guild/officer> - Default location to send reports."])
+		self:Echo(L["/expiration location <console/frame/raid/party/guild/officer> - Default location to send reports."])
 		self:Echo(L["/expiration health - Toggles showing players health in death report."])
 		--self:Echo(L["/expiration cooldown - Toggles showing players cooldowns in death report."])
 		self:Echo(L["/expiration report <name> <report# or \'last\'> [dest[:target]] [lines] - Report on a given player."])
@@ -170,10 +167,9 @@ local COMBATLOG_OBJECT_TYPE_PLAYER = COMBATLOG_OBJECT_TYPE_PLAYER
 local GROUP_AFFILIATION = bit.bor(COMBATLOG_OBJECT_AFFILIATION_PARTY, COMBATLOG_OBJECT_AFFILIATION_RAID, COMBATLOG_OBJECT_AFFILIATION_MINE)
 
 function Expiration:COMBAT_LOG_EVENT_UNFILTERED(event, timestamp, eventType, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, ...)
-	--if( not events[eventType] or ( bit.band(destFlags, GROUP_AFFILIATION) == 0 or bit.band(destFlags, COMBATLOG_OBJECT_TYPE_PLAYER) ~= COMBATLOG_OBJECT_TYPE_PLAYER ) ) then return end
-	if( not events[eventType] or not groupUnitMap[destGUID] ) then return end
+	if( not events[eventType] or bit.band(destFlags, COMBATLOG_OBJECT_TYPE_PLAYER) ~= COMBATLOG_OBJECT_TYPE_PLAYER or ( bit.band(destFlags, COMBATLOG_OBJECT_AFFILIATION_PARTY) ~= COMBATLOG_OBJECT_AFFILIATION_PARTY and bit.band(destFlags, COMBATLOG_OBJECT_AFFILIATION_RAID) ~= COMBATLOG_OBJECT_AFFILIATION_RAID and bit.band(destFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) ~= COMBATLOG_OBJECT_AFFILIATION_MINE ) ) then return end
 	
-	groupInfo[destGUID] = groupInfo[destGUID] or {history = {}, reports = {}}
+	groupInfo[destGUID] = groupInfo[destGUID] or {history = {}, reports = {}, fades = {}}
 	local playerInfo = groupInfo[destGUID]
 	
 	-- Save cooldown information
@@ -186,58 +182,79 @@ function Expiration:COMBAT_LOG_EVENT_UNFILTERED(event, timestamp, eventType, sou
 		playerInfo.lastEvent = eventType
 		playerInfo.lastSpell = eventType == "ENVIRONMENTAL_DAMAGE" and getglobal("ACTION_ENVIRONMENTAL_DAMAGE_" .. (select(1, ...))) or eventType == "SWING_DAMAGE" and L["Melee"] or (select(2, ...))
 		playerInfo.lastSource = eventType == "ENVIRONMENTAL_DAMAGE" and L["Environment"] or sourceName
+		playerInfo.lastTime = timestamp
 	end
 	
 	if( events[eventType] > 0 and (select(events[eventType], ...)) < self.db.profile.threshold ) then
 		return
 	end
+		
+	-- Store everything in our regular history table, but put it into the fades table if a buff faded
+	-- this way we can compact it more
+	local field = "history"
+	if( eventType == "SPELL_AURA_REMOVED" and select(4, ...) == "BUFF" ) then
+		field = "fades"	
+	end
 	
-	self:AddEvent(destGUID, timestamp, CombatLog_OnEvent(Blizzard_CombatLog_CurrentSettings, timestamp, eventType, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, ...))
-
+	self:AddEvent(field, destName, destGUID, timestamp, eventType, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, ...)
+	
 	-- They died, so wrap this up into a report
 	if( eventType == "UNIT_DIED" ) then
-		self:AddReport(destGUID)
+		self:AddReport(timestamp, destGUID)
+	
+		-- Lets us see info on people even if they left the raid
+		nameToGUID[string.lower(destName)] = destGUID
 	end
 end
 
+-- Simply lets us store this in a more usable format for post processing when we need it
+local function compactList(...)
+	local text = ""
+	for i=1, select("#", ...) do
+		if( i > 1 ) then
+			text = text .. "|" .. (select(i, ...) or "!nil")
+		else
+			text = select(i, ...) or "!nil"
+		end
+	end
+	
+	return text
+end
 
 -- Add an event message to the specified id history
-function Expiration:AddEvent(guid, timestamp, message)
-	if( not message ) then return end
+function Expiration:AddEvent(field, name, guid, ...)
+	-- No info found
 	local playerInfo = groupInfo[guid]
+	if( not playerInfo ) then
+		return
+	end
 	
-	if( #(playerInfo.history) >= self.db.profile.lines ) then
-		table.remove(playerInfo.history, 1)
+	-- Prune old record if we hit our limit
+	if( #(playerInfo[field]) >= self.db.profile.lines ) then
+		table.remove(playerInfo[field], 1)
 	end
 		
-	-- Format with health
-	if( self.db.profile.health and groupUnitMap[guid] ) then
-		local health = UnitHealth(groupUnitMap[guid])
-		local percent = health / UnitHealthMax(groupUnitMap[guid])
-		local r, g
-		
-		if( percent > 0.5 ) then
-			r = 510 * (1 - percent)
-			g = 255
-		else
-			r = 255
-			g = 510 * percent
-		end
-		
-		table.insert(playerInfo.history, string.format("%05.2f [|cff%02X%02X00%d %d%%|r] %s", timestamp % 60, r, g, health, percent * 100, message))
-	else
-		table.insert(playerInfo.history, string.format("%05.2f %s", timestamp % 60, message))
+	-- Add the current and max health
+	local health = ""
+	local healthMax = ""
+	if( self.db.profile.health and UnitExists(name) ) then
+		health = UnitHealth(name)
+		healthMax = UnitHealthMax(name)
 	end
+	
+	table.insert(playerInfo[field], compactList(health, healthMax, ...))
 end
 
-function Expiration:AddReport(guid)
+function Expiration:AddReport(timestamp, guid)
 	local playerInfo = groupInfo[guid]
 	local report
 	
 	-- Reuse an old report if we can
 	if( #(playerInfo.reports) >= self.db.profile.reports ) then
 		report = table.remove(playerInfo.reports, 1)
+		report.isParsed = nil
 		
+		-- Reset what we have saved
 		for i=#(report), 1, -1 do
 			table.remove(report, i)
 		end
@@ -250,33 +267,331 @@ function Expiration:AddReport(guid)
 	-- Figure out what killed them (If we can)
 	if( playerInfo.lastSource and playerInfo.lastSpell ) then
 		report.cause = string.format("%s (%s)", playerInfo.lastSource, playerInfo.lastSpell)
+		report.deathStamp = playerInfo.lastTime
 	elseif( playerInfo.lastSource ) then
 		report.cause = playerInfo.lastSource
+		report.deathStamp = playerInfo.lastTime
 	elseif( playerInfo.lastSpell ) then
 		report.cause = playerInfo.lastSpell
+		report.deathStamp = playerInfo.lastTime
 	else
 		report.cause = "???"
+		report.deathStamp = timestamp
 	end
 	
-	-- Copy the report in
-	for id, msg in pairs(playerInfo.history) do
-		report[id] = msg
+	-- Move the data of the death into the report
+	for _, data in pairs(playerInfo.history) do
+		table.insert(report, data)
 	end
 	
+	for _, data in pairs(playerInfo.fades) do
+		table.insert(report, data)
+	end
 	
+	-- Store this death
 	table.insert(playerInfo.reports, report)
-end
 	
+	-- Reset our saved data
+	playerInfo.lastTime = nil
+	
+	for i=#(playerInfo.history), 1, -1 do table.remove(playerInfo.history, i) end
+	for i=#(playerInfo.fades), 1, -1 do table.remove(playerInfo.fades, i) end
+end
+
+-- Sort it using the timestamp	
+local function sortReport(a, b)
+	local timeA = select(3, string.split("|", a))
+	local timeB = select(3, string.split("|", b))
+	
+	return timeA < timeB
+end
+
+-- Tries to get the compressed spells to look as close as possible to the Blizzard ones
+-- but it's not 100% perfect since I don't want to reimplement the entire damn thing
+local defaultLineColor = { a = 1.0, r = 1.0, g = 1.0, b = 1.0 }
+local function parseSpell(eventType, spellID, spellName, spellSchool)
+	local settings = Blizzard_CombatLog_CurrentSettings.settings
+
+	-- Color ability names
+	if( settings.abilityColoring ) then
+		if( settings.abilitySchoolColoring ) then
+			abilityColor = CombatLog_Color_ColorArrayBySchool(tonumber(spellSchool), filterSettings)
+		elseif( spellSchool ) then 
+			abilityColor = settings.colors.defaults.spell
+		end
+	end
+
+	-- Highlight this color
+	if( settings.abilityHighlighting ) then
+		abilityColor = CombatLog_Color_HighlightColorArray(abilityColor or defaultLineColor)
+	end
+	
+	if( abilityColor ) then
+		abilityColor = CombatLog_Color_FloatToText(abilityColor)
+		spellName = string.format("|c%s%s|r", abilityColor, spellName)
+	end
+
+	if( settings.braces and settings.spellBraces ) then
+		spellName = string.format(TEXT_MODE_A_STRING_BRACE_SPELL, "FFFFFFFF", spellName, "FFFFFFFF")
+	end
+	
+	local text = string.format(TEXT_MODE_A_STRING_SPELL, spellID, eventType, spellName, spellID)
+	
+	return text
+end
+
+-- Parse the data into the actual Blizzard text value
+local messageData = {}
+local function parseMessage(...)
+	-- This is a little bit of a hack, we need to convert everything into a number if needed
+	-- because Blizzard expects it to be one, but since we can't modify a vararg
+	-- we have to push it all into a table, I'll come up with a cleaner method soon thats not ugly.
+	for id in pairs(messageData) do messageData[id] = nil end
+	for i=3, select("#", ...) do
+		local data = select(i, ...)
+		if( data ~= "!nil" ) then
+			messageData[i - 2] = tonumber(data) or data
+		end
+	end
+	
+	-- Parse it into the combat log format
+	local text = CombatLog_OnEvent(Blizzard_CombatLog_CurrentSettings, unpack(messageData))
+	
+	-- Add the health info we have to
+	local health, maxHealth = select(1, ...)
+	health = tonumber(health)
+	maxHealth = tonumber(maxHealth)
+	
+	if( health and maxHealth ) then
+		local percent = health / maxHealth
+		local r, g
+		if( percent > 0.5 ) then
+			r = 510 * (1 - percent)
+			g = 255
+		else
+			r = 255
+			g = 510 * percent
+		end
+		
+		return string.format("%05.2f [|cff%02X%02X00%d %d%%|r] %s", messageData[1] % 60, r, g, health, percent * 100, text)
+	end
+
+	return string.format("%05.2f %s", messageData[1] % 60, text)
+end
+
+-- Parse the report if needed
+-- Because we store reports with the raw data we're provided instead of parsing them, we might have to
+-- compile it all into readable text and do fancy work like that.
+local compressedBuffs = {}
+local function parseReport(report)
+	if( report.isParsed ) then
+		return
+	end
+
+	report.isParsed = true
+
+	-- Sort the table so the the last entry is the death
+	table.sort(report, sortReport)
+
+	-- Compress all buff fades within the last 0.5 seconds before we died
+	local buffThreshold = report.deathStamp - 0.5
+
+	-- Reset our temp table for buffs
+	for i=#(compressedBuffs), 1, -1 do table.remove(compressedBuffs, i) end
+
+	-- Now find all buffs that faded within the threshold
+	local savedData
+	for i=#(report), 1, -1 do
+		local data = report[i]
+		local timestamp, eventType, _, _, _, _, _, _, spellID, spellName, spellSchool, auraType = select(3, string.split("|", data))
+		if( eventType == "SPELL_AURA_REMOVED" and auraType == "BUFF" ) then
+			if( tonumber(timestamp) >= buffThreshold ) then
+				table.insert(compressedBuffs, parseSpell(eventType, spellID, spellName, spellSchool))
+
+				-- If it's the first buff we added, will "save" it so the rest of the buffs can go in this line
+				if( not savedData ) then
+					savedData = parseMessage(string.split("|", data))
+					report[i] = "SAVED"
+				else
+					table.remove(report, i)
+				end
+			else
+				report[i] = parseMessage(string.split("|", data))
+			end
+		else
+			report[i] = parseMessage(string.split("|", data))
+		end
+	end
+
+	-- We have compressed buffs
+	if( savedData ) then
+		-- Because we remove entries, we have to search for our saved one again, slightly silly but oh well.
+		for id, data in pairs(report) do
+			if( data == "SAVED" ) then
+				report[id] = string.gsub(savedData, "|Hspell:(.-)|h(.-)|h", table.concat(compressedBuffs, ", "))
+				break
+			end
+		end
+	end
+end
+
+-- Show the report in a frame
+function Expiration:ReportFrame(name, lines, report)
+	if( not self.frame ) then
+		local backdrop = {
+			bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+			edgeFile = "Interface\\ChatFrame\\ChatFrameBackground",
+			tile = true,
+			edgeSize = 1,
+			tileSize = 5,
+			insets = {left = 1, right = 1, top = 1, bottom = 1}
+		}
+
+		self.frame = CreateFrame("Frame", nil, UIParent)
+		self.frame:SetWidth(550)
+		self.frame:SetHeight(275)
+		self.frame:SetBackdrop(backdrop)
+		self.frame:SetBackdropColor(0.0, 0.0, 0.0, 1.0)
+		self.frame:SetBackdropBorderColor(0.65, 0.65, 0.65, 1.0)
+		self.frame:SetMovable(true)
+		self.frame:EnableMouse(true)
+		self.frame:Hide()
+		
+		-- Positioner thing
+		local mover = CreateFrame("Button", nil, self.frame)
+		mover:SetPoint("TOPLEFT", self.frame, "TOPLEFT", 0, 0)
+		mover:SetPoint("TOPRIGHT", self.frame, "TOPRIGHT", -15, 0)
+		mover:SetHeight(18)
+
+		mover:SetScript("OnMouseUp", function(self)
+			if( self.isMoving ) then
+				local parent = self:GetParent()
+				local scale = parent:GetEffectiveScale()
+
+				self.isMoving = nil
+				parent:StopMovingOrSizing()
+
+				Expiration.db.profile.position = {x = parent:GetLeft() * scale, y = parent:GetTop() * scale}
+			end
+		end)
+
+		mover:SetScript("OnMouseDown", function(self, mouse)
+			local parent = self:GetParent()
+
+			-- Start moving!
+			if( parent:IsMovable() and mouse == "LeftButton" ) then
+				self.isMoving = true
+				parent:StartMoving()
+
+			-- Reset position
+			elseif( mouse == "RightButton" ) then
+				parent:ClearAllPoints()
+				parent:SetPoint("CENTER", UIParent, "CENTER")
+
+				Expiration.db.profile.position = nil
+			end
+		end)
+		
+		self.frame.mover = mover
+		
+		-- Fix edit box size
+		self.frame:SetScript("OnShow", function(self)
+			self.child:SetHeight(self.scroll:GetHeight())
+			self.child:SetWidth(self.scroll:GetWidth())
+			self.editBox:SetWidth(self.scroll:GetWidth())
+		end)
+		
+		-- Report description
+		self.frame.title = self.frame:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		self.frame.title:SetPoint("TOPLEFT", self.frame, "TOPLEFT", 2, -2)
+		
+		-- Close button (Shocking!)
+		local button = CreateFrame("Button", nil, self.frame, "UIPanelCloseButton")
+		button:SetPoint("TOPRIGHT", self.frame, "TOPRIGHT", 6, 6)
+		button:SetScript("OnClick", function()
+			HideUIPanel(self.frame)
+		end)
+		
+		self.frame.closeButton = button
+		
+		-- Create the container frame for the scroll box
+		local container = CreateFrame("Frame", nil, self.frame)
+		container:SetHeight(265)
+		container:SetWidth(1)
+		container:ClearAllPoints()
+		container:SetPoint("BOTTOMLEFT", self.frame, 0, -9)
+		container:SetPoint("BOTTOMRIGHT", self.frame, 4, 0)
+		
+		self.frame.container = container
+		
+		-- Scroll frame
+		local scroll = CreateFrame("ScrollFrame", "ExpirationFrameScroll", container, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", 5, 0)
+		scroll:SetPoint("BOTTOMRIGHT", -28, 10)
+		
+		self.frame.scroll = scroll
+		
+		local child = CreateFrame("Frame", nil, scroll)
+		scroll:SetScrollChild(child)
+		child:SetHeight(2)
+		child:SetWidth(2)
+		
+		self.frame.child = child
+
+		-- Create the actual edit box
+		local editBox = CreateFrame("EditBox", nil, child)
+		editBox:SetPoint("TOPLEFT")
+		editBox:SetHeight(50)
+		editBox:SetWidth(50)
+
+		editBox:SetMultiLine(true)
+		editBox:SetAutoFocus(false)
+		editBox:EnableMouse(true)
+		editBox:SetFontObject(GameFontHighlightSmall)
+		editBox:SetTextInsets(0, 0, 0, 0)
+		editBox:SetScript("OnEscapePressed", editBox.ClearFocus)
+		scroll:SetScript("OnMouseUp", function() editBox:SetFocus() end)	
+
+		self.frame.editBox = editBox		
+
+		if( self.db.profile.position ) then
+			local scale = self.frame:GetEffectiveScale()
+			
+			self.frame:ClearAllPoints()
+			self.frame:SetPoint("TOPLEFT", nil, "BOTTOMLEFT", self.db.profile.position.x / scale, self.db.profile.position.y / scale)
+		else
+			self.frame:SetPoint("CENTER", UIParent, "CENTER")
+		end
+	end
+	
+	-- Set who the report is about
+	self.frame.title:SetFormattedText(L["Report for %s (Last %d events)"], name, lines)
+	self.frame:Show()
+	
+	-- Add all the data
+	local reportText
+	for line = #(report) - lines + 1, #(report) do
+		if( report[line] ) then
+			local text = string.format("%d. %s", #(report) - line + 1, report[line])
+			if( reportText ) then
+				reportText = reportText .. "\n" .. text
+			else
+				reportText = text
+			end
+		end
+	end
+	
+	self.frame.editBox:SetText(reportText)
+end
+
 -- Send a report
 function Expiration:Report(name, reportNum, dest, lines)
 	-- Search for the player
 	local playerInfo
-	for guid, unit in pairs(groupUnitMap) do
-		local uName = string.lower(UnitName(unit) or "")
-		if( string.lower(name) == uName ) then
-			playerInfo = groupInfo[guid]
-			break
-		end
+	local guid = nameToGUID[string.lower(name or "")]
+	if( guid ) then
+		name = UnitName(name)
+		playerInfo = groupInfo[guid]
 	end
 	
 	if( not playerInfo ) then
@@ -319,21 +634,27 @@ function Expiration:Report(name, reportNum, dest, lines)
 		dest = self.db.profile.location
 	end
 	
+	-- Parse it if needed to get it into a usable format
+	parseReport(report)
+
 	-- Make sure it's a valid line count
 	lines = lines or self.db.profile.lines
 	lines = lines < 1 and 1 or lines > #(report) and #(report) or lines
 	
 	-- WHISPER:Distomos, CHANNEL:1, etc
-	local type, target = strsplit(":", dest, 2);
+	local type, target = strsplit(":", dest, 2)
 	target = string.trim(target or "")
 	
 	if( type == "console" ) then
 		self:Print(string.format(L["Report for %s (Last %d events)"], name, lines))
 		for line = #(report) - lines + 1, #(report) do
 			if( report[line] ) then
-				self:Echo(string.format("%d. %s", #report - line + 1, report[line]))
+				self:Echo(string.format("%d. %s", #(report) - line + 1, report[line]))
 			end
 		end
+		return
+	elseif( type == "frame" ) then
+		self:ReportFrame(name, lines, report)
 		return
 	elseif( not validType[type] ) then
 		self:Print(string.format(L["Invalid chat destination entered \"%s\"."], type))
@@ -369,22 +690,9 @@ function Expiration:Report(name, reportNum, dest, lines)
 	SendChatMessage(string.format(L["Expiration report for %s (Last %d events)"], name, lines), type, nil, target)
 	for line = #(report - lines + 1), #(report) do
 		if( report[line] ) then
-			SendChatMessage(string.format("%d. %s", #report - line + 1, report[line]), type, nil, target)
+			SendChatMessage(string.format("%d. %s", #(report) - line + 1, report[line]), type, nil, target)
 		end
 	end
-end
-
-
-function Expiration:UpdateRoster()
-	for i=1, GetNumRaidMembers() do
-		groupUnitMap[UnitGUID(raidMap[i])] = raidMap[i]
-	end
-
-	for i=1, GetNumPartyMembers() do
-		groupUnitMap[UnitGUID(partyMap[i])] = partyMap[i]
-	end
-
-	groupUnitMap[UnitGUID("player")] = "player"
 end
 
 function Expiration:Echo(msg)
