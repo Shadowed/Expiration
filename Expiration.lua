@@ -159,6 +159,15 @@ local killEvents = {
 	["DAMAGE_SHIELD"] = true,
 }
 
+-- These are spells that are blocked regardless, things that are generally spammy and useless
+-- like Ferocious Inspiration
+local blacklist = {
+	-- Ferocious Inspiration
+	[(GetSpellInfo(34460))] = true,
+	-- Abominable Might
+	[(GetSpellInfo(53136))] = true,
+}
+
 -- We only care about things that happen to group members
 local COMBATLOG_OBJECT_AFFILIATION_MINE = COMBATLOG_OBJECT_AFFILIATION_MINE
 local COMBATLOG_OBJECT_AFFILIATION_PARTY = COMBATLOG_OBJECT_AFFILIATION_PARTY
@@ -185,15 +194,24 @@ function Expiration:COMBAT_LOG_EVENT_UNFILTERED(event, timestamp, eventType, sou
 		playerInfo.lastTime = timestamp
 	end
 	
+	-- Threshold
 	if( events[eventType] > 0 and (select(events[eventType], ...)) < self.db.profile.threshold ) then
 		return
 	end
-		
+	
+	-- Spammy spells
+	if( select(2, ...) and blacklist[select(2, ...)] ) then
+		return
+	end
+	
 	-- Store everything in our regular history table, but put it into the fades table if a buff faded
 	-- this way we can compact it more
 	local field = "history"
 	if( eventType == "SPELL_AURA_REMOVED" and select(4, ...) == "BUFF" ) then
 		field = "fades"	
+	-- Spirit of Redemption, ignore the next death
+	elseif( eventType == "SPELL_AURA_APPLIED" and select(1, ...) == 27827 ) then
+		playerInfo.hasSpirit = true
 	end
 	
 	self:AddEvent(field, destName, destGUID, timestamp, eventType, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, ...)
@@ -248,6 +266,12 @@ end
 function Expiration:AddReport(timestamp, guid)
 	local playerInfo = groupInfo[guid]
 	local report
+	
+	-- Stop reports from Spirit of Redemption
+	if( playerInfo.hasSpirit ) then
+		playerInfo.hasSpirit = nil
+		return
+	end
 	
 	-- Reuse an old report if we can
 	if( #(playerInfo.reports) >= self.db.profile.reports ) then
@@ -394,8 +418,8 @@ local function parseReport(report)
 	table.sort(report, sortReport)
 
 	-- Compress all buff fades within the last 0.5 seconds before we died
-	local buffThreshold = report.deathStamp - 0.5
-
+	local buffThreshold = (report.deathStamp or 99999999999) - 0.5
+	
 	-- Reset our temp table for buffs
 	for i=#(compressedBuffs), 1, -1 do table.remove(compressedBuffs, i) end
 
@@ -455,6 +479,7 @@ function Expiration:ReportFrame(name, lines, report)
 		self.frame:SetBackdropBorderColor(0.65, 0.65, 0.65, 1.0)
 		self.frame:SetMovable(true)
 		self.frame:EnableMouse(true)
+		self.frame:SetFrameStrata("HIGH")
 		self.frame:Hide()
 		
 		-- Positioner thing
